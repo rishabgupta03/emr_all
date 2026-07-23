@@ -2,12 +2,20 @@
 """
 Control: EMR cluster is not publicly accessible.
 
-Checks every active EMR cluster in every enabled region and verifies BOTH:
+Checks every EMR cluster (in every state) in every enabled region and
+verifies BOTH of the following for clusters that are currently active:
   1. No cluster EC2 instance has a public IP address.
   2. None of the cluster's associated security groups allow unrestricted
      inbound access (0.0.0.0/0 or ::/0) from the internet.
 
 A cluster fails the control if either condition is not met.
+
+Unlike a previous version of this script, ALL clusters are now listed
+(not just STARTING/BOOTSTRAPPING/RUNNING/WAITING), so the "Total Checked"
+count matches what's visible in the console. Terminated/terminating
+clusters have no running EC2 instances, so there is nothing to check for
+public exposure on them - these are reported as SKIPPED with a clear
+reason rather than silently omitted from the results entirely.
 """
 
 import boto3
@@ -23,7 +31,7 @@ from botocore.exceptions import ClientError
 def get_session(role_arn=None):
     if role_arn:
         base = boto3.Session()
-        sts = base.client("sts")
+        sts = base.client("sts", region_name="us-east-1")
         assumed = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName="control-audit"
@@ -64,7 +72,16 @@ def error_evidence(e):
     return code, f"{code}: {msg}"[:200]
 
 
-ACTIVE_STATES = ["STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING"]
+# All possible EMR cluster states - used so list_clusters returns
+# every cluster, not just the ones currently running.
+ALL_STATES = [
+    "STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING",
+    "TERMINATING", "TERMINATED", "TERMINATED_WITH_ERRORS"
+]
+
+# Only clusters in these states have live EC2 instances / active
+# security group associations worth checking for public exposure.
+ACTIVE_STATES = {"STARTING", "BOOTSTRAPPING", "RUNNING", "WAITING"}
 
 
 def get_cluster_public_ips(ec2, cluster_id):
@@ -154,7 +171,9 @@ def check_control(session):
             ec2 = session.client("ec2", region_name=region)
             paginator = emr.get_paginator("list_clusters")
             clusters = []
-            for page in paginator.paginate(ClusterStates=ACTIVE_STATES):
+            # Pass ALL_STATES so terminated/terminating clusters are
+            # included in the results, matching what's visible in console.
+            for page in paginator.paginate(ClusterStates=ALL_STATES):
                 clusters.extend(page.get("Clusters", []))
         except ClientError as e:
             code, evidence = error_evidence(e)
@@ -169,9 +188,25 @@ def check_control(session):
             continue
 
         for cluster in clusters:
-            total_checked += 1
             cluster_id = cluster.get("Id", "N/A")
             cluster_arn = cluster.get("ClusterArn", "N/A")
+            cluster_state = cluster.get("Status", {}).get("State", "Unknown")
+
+            # --- Terminated/terminating clusters have no live instances
+            #     or active SG associations worth checking. Report them
+            #     explicitly as SKIPPED (not silently omitted). ---
+            if cluster_state not in ACTIVE_STATES:
+                skipped += 1
+                results.append({
+                    "Region": region,
+                    "ClusterId": cluster_id,
+                    "ClusterArn": cluster_arn,
+                    "Status": "SKIPPED",
+                    "Evidence": f"Cluster is not active (state: {cluster_state}) - no running instances to check for public exposure"
+                })
+                continue
+
+            total_checked += 1
 
             try:
                 public_ips = get_cluster_public_ips(ec2, cluster_id)
